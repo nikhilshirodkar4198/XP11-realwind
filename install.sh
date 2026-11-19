@@ -1,18 +1,12 @@
 #!/bin/bash
 set -e
 
-# Check for cmake
-if ! command -v cmake &>/dev/null; then
-    echo "cmake not found. Install it with: brew install cmake"
+PLUGIN="$(dirname "$0")/RealWind.xpl"
+
+if [ ! -f "$PLUGIN" ]; then
+    echo "RealWind.xpl not found. Try re-downloading the repo."
     exit 1
 fi
-
-# Build
-echo "Building RealWind..."
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" 2>&1
-make -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
-cd ..
 
 # Find X-Plane 11
 XP=""
@@ -25,17 +19,15 @@ for p in \
 done
 
 if [ -z "$XP" ]; then
-    echo ""
-    echo "Build succeeded but X-Plane 11 not found in common locations."
+    echo "X-Plane 11 not found in common locations."
     echo "Copy manually:"
     echo "  mkdir -p \"X-Plane 11/Resources/plugins/RealWind/64\""
-    echo "  cp build/RealWind.xpl \"X-Plane 11/Resources/plugins/RealWind/64/mac.xpl\""
-    exit 0
+    echo "  cp RealWind.xpl \"X-Plane 11/Resources/plugins/RealWind/64/mac.xpl\""
+    exit 1
 fi
 
 DEST="$XP/Resources/plugins/RealWind/64"
 mkdir -p "$DEST"
-cp build/RealWind.xpl "$DEST/mac.xpl"
-echo ""
+cp "$PLUGIN" "$DEST/mac.xpl"
 echo "Installed → $DEST/mac.xpl"
 echo "Launch X-Plane and check Log.txt for: RealWind: loaded"
