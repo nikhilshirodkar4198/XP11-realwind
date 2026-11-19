@@ -23,30 +23,31 @@ Every 5 minutes the plugin reads the aircraft's lat/lon, queries Open-Meteo for 
 
 Log output (X-Plane Log.txt): `RealWind: 270 deg @ 15 kts`
 
-## Dependencies
+## Install (macOS / Linux)
 
-- [X-Plane SDK](https://developer.x-plane.com/sdk/) (headers only — place in `SDK/` or pass `-DXPLANE_SDK=...`)
-- libcurl (`brew install curl` / `apt install libcurl4-openssl-dev` / vcpkg on Windows)
-- CMake 3.15+
+**Prerequisites:** Xcode Command Line Tools + CMake
+```sh
+xcode-select --install   # macOS only, skip if already installed
+brew install cmake       # or download from cmake.org
+```
 
-## Build
+**Clone and install in one step:**
+```sh
+git clone https://github.com/nikhilshirodkar4198/XP11-realwind.git
+cd XP11-realwind
+./install.sh
+```
 
+The script builds the plugin and auto-detects your X-Plane 11 installation. No SDK download, no extra libraries.
+
+## Install (Windows)
+
+Windows requires the [X-Plane SDK](https://developer.x-plane.com/sdk/) for the XPLM linker stub:
 ```sh
 mkdir build && cd build
-cmake .. -DXPLANE_SDK=/path/to/XPSDK
+cmake .. -DXPLANE_SDK=C:/path/to/SDK
 cmake --build . --config Release
 ```
-
-Output: `RealWind.xpl`
-
-## Install
-
-Copy `RealWind.xpl` to:
-
-```
-X-Plane 11/Resources/plugins/RealWind/64/win.xpl   # Windows
-X-Plane 11/Resources/plugins/RealWind/64/lin.xpl   # Linux
-X-Plane 11/Resources/plugins/RealWind/64/mac.xpl   # macOS
-```
+Copy `build/RealWind.xpl` → `X-Plane 11/Resources/plugins/RealWind/64/win.xpl`
 
 > **Note:** Leave X-Plane's built-in real weather **enabled**. The plugin re-injects METAR wind every 2 seconds to override X-Plane's wind values while leaving clouds, visibility, and pressure untouched.
