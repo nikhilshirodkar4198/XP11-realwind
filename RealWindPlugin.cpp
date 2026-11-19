@@ -9,8 +9,9 @@
 #include "XPLMProcessing.h"
 #include "XPLMUtilities.h"
 
-#define REFRESH_SEC 300.0f
-#define POLL_SEC     15.0f
+#define REFRESH_SEC   300.0f  // re-fetch METAR interval
+#define INJECT_SEC      2.0f  // re-inject wind interval (beats X-Plane live weather updates)
+#define POLL_SEC       15.0f  // wait interval before first METAR arrives
 
 static XPLMDataRef gLat, gLon, gWindDir, gWindSpd, gWindAlt;
 
@@ -93,31 +94,40 @@ static void spawn_fetch(void) {
     }
 }
 
-static float loop_cb(float, float, int, void *) {
+static float g_elapsed = 0.0f;  // time since last METAR fetch
+
+static float loop_cb(float sinceLastCall, float, int, void *) {
     pthread_mutex_lock(&gMutex);
-    int ready    = g_ready;
-    int fetching = g_fetching;
-    float dir = g_dir, spd = g_spd;
-    if (ready) g_ready = 0;
+    int   ready    = g_ready;
+    int   fetching = g_fetching;
+    float dir      = g_dir;
+    float spd      = g_spd;
+    if (ready) { g_ready = 0; }
     pthread_mutex_unlock(&gMutex);
 
+    // Log and cache when fresh METAR data arrives
     if (ready) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "RealWind: updated %.0f deg @ %.0f kts\n", dir, spd);
+        XPLMDebugString(msg);
+    }
+
+    // Always inject cached wind at high frequency to override X-Plane live weather
+    if (dir >= 0 && spd >= 0) {
         XPLMSetDatavf(gWindDir, &dir, 0, 1);
         XPLMSetDatavf(gWindSpd, &spd, 0, 1);
         float alt = 0.0f;
         XPLMSetDatavf(gWindAlt, &alt, 0, 1);
-        char msg[64];
-        snprintf(msg, sizeof(msg), "RealWind: %.0f deg @ %.0f kts\n", dir, spd);
-        XPLMDebugString(msg);
-
-        pthread_mutex_lock(&gMutex); spawn_fetch(); pthread_mutex_unlock(&gMutex);
-        return REFRESH_SEC;
     }
 
-    if (!fetching) {
+    // Trigger a new METAR fetch on startup (no data yet) or every REFRESH_SEC
+    g_elapsed += sinceLastCall;
+    if (!fetching && (dir < 0 || g_elapsed >= REFRESH_SEC)) {
         pthread_mutex_lock(&gMutex); spawn_fetch(); pthread_mutex_unlock(&gMutex);
+        g_elapsed = 0.0f;
     }
-    return POLL_SEC;
+
+    return (dir < 0) ? POLL_SEC : INJECT_SEC;
 }
 
 PLUGIN_API int XPluginStart(char *name, char *sig, char *desc) {

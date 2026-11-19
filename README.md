@@ -34,4 +34,4 @@ X-Plane 11/Resources/plugins/RealWind/64/lin.xpl   # Linux
 X-Plane 11/Resources/plugins/RealWind/64/mac.xpl   # macOS
 ```
 
-> **Note:** Disable X-Plane's built-in real weather ("Download real weather" in Weather settings) to prevent it from overriding the injected values.
+> **Note:** Leave X-Plane's built-in real weather **enabled**. The plugin re-injects METAR wind every 2 seconds to override X-Plane's wind values while leaving clouds, visibility, and pressure untouched.
