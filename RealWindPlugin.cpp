@@ -44,7 +44,7 @@ static XPLMDataRef gLat, gLon, gWindDir, gWindSpd, gWindAlt;
 
 static pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
 static float g_dirs[NUM_LAYERS], g_spds[NUM_LAYERS];
-static int   g_ready = 0, g_fetching = 0, g_has_data = 0;
+static int   g_ready = 0, g_fetching = 0, g_has_data = 0, g_nlayers = NUM_LAYERS;
 
 struct Buf { char *data; size_t size; };
 
@@ -93,11 +93,18 @@ static int find_hour_index(const char *json) {
     return idx;
 }
 
-typedef struct { double lat, lon; } FetchArgs;
+// HRRR covers CONUS and tops out at 100 hPa (~53k ft) — skip 70 hPa layer for it
+#define HRRR_LAYERS 9
+
+typedef struct { double lat, lon; const char *model; int nlayers; } FetchArgs;
+
+static int is_conus(double lat, double lon) {
+    return lat >= 24.0 && lat <= 50.0 && lon >= -125.0 && lon <= -65.0;
+}
 
 static void *fetch_thread(void *arg) {
     FetchArgs *fa = (FetchArgs *)arg;
-    char url[512];
+    char url[640];
     snprintf(url, sizeof(url),
         "https://api.open-meteo.com/v1/forecast"
         "?latitude=%.4f&longitude=%.4f"
@@ -111,8 +118,9 @@ static void *fetch_thread(void *arg) {
         ",windspeed_150hPa,winddirection_150hPa"
         ",windspeed_100hPa,winddirection_100hPa"
         ",windspeed_70hPa,winddirection_70hPa"
-        "&wind_speed_unit=kn&forecast_days=1&timeformat=unixtime",
-        fa->lat, fa->lon);
+        "&wind_speed_unit=kn&forecast_days=1&timeformat=unixtime&models=%s",
+        fa->lat, fa->lon, fa->model);
+    int nlayers = fa->nlayers;
     free(fa);
 
     CURL *c = curl_easy_init();
@@ -131,14 +139,15 @@ static void *fetch_thread(void *arg) {
         int hi = find_hour_index(b.data);
         float dirs[NUM_LAYERS], spds[NUM_LAYERS];
         int ok = 1;
-        for (int i = 0; i < NUM_LAYERS; i++) {
+        for (int i = 0; i < nlayers; i++) {
             dirs[i] = parse_array_at(b.data, DIR_VARS[i], hi);
             spds[i] = parse_array_at(b.data, SPD_VARS[i], hi);
             if (dirs[i] < 0 || spds[i] < 0) { ok = 0; break; }
         }
         if (ok) {
             pthread_mutex_lock(&gMutex);
-            for (int i = 0; i < NUM_LAYERS; i++) { g_dirs[i] = dirs[i]; g_spds[i] = spds[i]; }
+            for (int i = 0; i < nlayers; i++) { g_dirs[i] = dirs[i]; g_spds[i] = spds[i]; }
+            g_nlayers = nlayers;
             g_ready = 1;
             pthread_mutex_unlock(&gMutex);
         }
@@ -150,8 +159,10 @@ static void *fetch_thread(void *arg) {
 
 static void spawn_fetch(void) {
     FetchArgs *fa = (FetchArgs *)malloc(sizeof(FetchArgs));
-    fa->lat = XPLMGetDatad(gLat);
-    fa->lon = XPLMGetDatad(gLon);
+    fa->lat  = XPLMGetDatad(gLat);
+    fa->lon  = XPLMGetDatad(gLon);
+    fa->model   = is_conus(fa->lat, fa->lon) ? "gfs_hrrr"      : "icon_seamless";
+    fa->nlayers = is_conus(fa->lat, fa->lon) ? HRRR_LAYERS : NUM_LAYERS;
     pthread_t t;
     if (pthread_create(&t, NULL, fetch_thread, fa) == 0) { pthread_detach(t); g_fetching = 1; }
     else free(fa);
@@ -164,6 +175,7 @@ static float loop_cb(float dt, float, int, void *) {
     int ready    = g_ready;
     int fetching = g_fetching;
     int has_data = g_has_data;
+    int nlayers  = g_nlayers;
     float dirs[NUM_LAYERS], spds[NUM_LAYERS];
     for (int i = 0; i < NUM_LAYERS; i++) { dirs[i] = g_dirs[i]; spds[i] = g_spds[i]; }
     if (ready) { g_ready = 0; g_has_data = 1; has_data = 1; }
@@ -178,7 +190,7 @@ static float loop_cb(float dt, float, int, void *) {
     }
 
     if (has_data) {
-        for (int i = 0; i < NUM_LAYERS; i++) {
+        for (int i = 0; i < nlayers; i++) {
             XPLMSetDatavf(gWindDir, &dirs[i], i, 1);
             XPLMSetDatavf(gWindSpd, &spds[i], i, 1);
             float alt = LAYER_ALT_M[i];
@@ -214,7 +226,7 @@ PLUGIN_API int XPluginStart(char *name, char *sig, char *desc) {
     for (int i = 0; i < NUM_LAYERS; i++) { g_dirs[i] = -1; g_spds[i] = -1; }
     curl_global_init(CURL_GLOBAL_DEFAULT);
     XPLMRegisterFlightLoopCallback(loop_cb, 1.0f, NULL);
-    XPLMDebugString("RealWind: loaded (7 wind layers, Open-Meteo)\n");
+    XPLMDebugString("RealWind: loaded — HRRR (1h) over CONUS, ICON (3h) global\n");
     return 1;
 }
 
