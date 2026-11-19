@@ -14,37 +14,43 @@
 #define INJECT_SEC    2.0f
 #define POLL_SEC     15.0f
 #define NUM_LAYERS     10
+#define HRRR_LAYERS     9  // HRRR tops at 100 hPa, skip 70 hPa layer
 
-// Pressure level → approximate MSL altitude in metres
+// Layers 1-9: Open-Meteo pressure levels (HRRR or ICON)
+// Layer 0:    METAR surface observation (overrides model surface)
 static const float LAYER_ALT_M[NUM_LAYERS] = {
-    111.0f,    // 1000 hPa  ~   364 ft
-    762.0f,    //  925 hPa  ~ 2,500 ft
-    1524.0f,   //  850 hPa  ~ 5,000 ft
-    3048.0f,   //  700 hPa  ~10,000 ft
-    5486.0f,   //  500 hPa  ~18,000 ft
-    9144.0f,   //  300 hPa  ~30,000 ft
-    11887.0f,  //  200 hPa  ~39,000 ft
-    13608.0f,  //  150 hPa  ~44,600 ft
-    16180.0f,  //  100 hPa  ~53,000 ft
-    18300.0f   //   70 hPa  ~60,000 ft
+      0.0f,    // surface  — METAR actual ground obs
+    762.0f,    //  925 hPa ~ 2,500 ft
+   1524.0f,    //  850 hPa ~ 5,000 ft
+   3048.0f,    //  700 hPa ~10,000 ft
+   5486.0f,    //  500 hPa ~18,000 ft
+   9144.0f,    //  300 hPa ~30,000 ft
+  11887.0f,    //  200 hPa ~39,000 ft
+  13608.0f,    //  150 hPa ~44,600 ft
+  16180.0f,    //  100 hPa ~53,000 ft
+  18300.0f     //   70 hPa ~60,000 ft
 };
 
-static const char *SPD_VARS[NUM_LAYERS] = {
-    "windspeed_1000hPa","windspeed_925hPa","windspeed_850hPa",
-    "windspeed_700hPa","windspeed_500hPa","windspeed_300hPa",
-    "windspeed_200hPa","windspeed_150hPa","windspeed_100hPa","windspeed_70hPa"
+// Aloft vars start at 925 hPa (index 1); surface handled by METAR
+static const char *SPD_VARS[NUM_LAYERS - 1] = {
+    "windspeed_925hPa","windspeed_850hPa","windspeed_700hPa",
+    "windspeed_500hPa","windspeed_300hPa","windspeed_200hPa",
+    "windspeed_150hPa","windspeed_100hPa","windspeed_70hPa"
 };
-static const char *DIR_VARS[NUM_LAYERS] = {
-    "winddirection_1000hPa","winddirection_925hPa","winddirection_850hPa",
-    "winddirection_700hPa","winddirection_500hPa","winddirection_300hPa",
-    "winddirection_200hPa","winddirection_150hPa","winddirection_100hPa","winddirection_70hPa"
+static const char *DIR_VARS[NUM_LAYERS - 1] = {
+    "winddirection_925hPa","winddirection_850hPa","winddirection_700hPa",
+    "winddirection_500hPa","winddirection_300hPa","winddirection_200hPa",
+    "winddirection_150hPa","winddirection_100hPa","winddirection_70hPa"
 };
 
 static XPLMDataRef gLat, gLon, gWindDir, gWindSpd, gWindAlt;
 
 static pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
 static float g_dirs[NUM_LAYERS], g_spds[NUM_LAYERS];
-static int   g_ready = 0, g_fetching = 0, g_has_data = 0, g_nlayers = NUM_LAYERS;
+static int   g_aloft_ready = 0, g_aloft_fetching = 0;
+static int   g_metar_ready = 0, g_metar_fetching = 0;
+static int   g_has_aloft = 0,   g_has_metar = 0;
+static int   g_nlayers = NUM_LAYERS;
 
 struct Buf { char *data; size_t size; };
 
@@ -59,7 +65,6 @@ static size_t write_cb(void *ptr, size_t sz, size_t n, void *ud) {
     return total;
 }
 
-// Return value at index idx inside a JSON array named key
 static float parse_array_at(const char *json, const char *key, int idx) {
     char k[64]; snprintf(k, sizeof(k), "\"%s\":[", key);
     const char *p = strstr(json, k);
@@ -74,7 +79,6 @@ static float parse_array_at(const char *json, const char *key, int idx) {
     return (float)atof(p);
 }
 
-// Find hourly index whose unix timestamp bracket contains now
 static int find_hour_index(const char *json) {
     const char *p = strstr(json, "\"time\":[");
     if (!p) return 0;
@@ -93,23 +97,69 @@ static int find_hour_index(const char *json) {
     return idx;
 }
 
-// HRRR covers CONUS and tops out at 100 hPa (~53k ft) — skip 70 hPa layer for it
-#define HRRR_LAYERS 9
-
-typedef struct { double lat, lon; const char *model; int nlayers; } FetchArgs;
+static float parse_field(const char *json, const char *key) {
+    char k[32]; snprintf(k, sizeof(k), "\"%s\":", key);
+    const char *p = strstr(json, k);
+    if (!p) return -1;
+    p += strlen(k);
+    while (*p == ' ') p++;
+    if (*p == '"' || *p == 'n' || *p == 'V') return -1;
+    return (float)atof(p);
+}
 
 static int is_conus(double lat, double lon) {
     return lat >= 24.0 && lat <= 50.0 && lon >= -125.0 && lon <= -65.0;
 }
 
-static void *fetch_thread(void *arg) {
-    FetchArgs *fa = (FetchArgs *)arg;
+typedef struct { double lat, lon; const char *model; int nlayers; } AloftArgs;
+typedef struct { double lat, lon; } MetarArgs;
+
+// --- METAR thread: fetches surface obs, writes layer 0 ---
+static void *fetch_metar_thread(void *arg) {
+    MetarArgs *ma = (MetarArgs *)arg;
+    char url[256];
+    snprintf(url, sizeof(url),
+        "https://aviationweather.gov/api/data/metar"
+        "?bbox=%.2f,%.2f,%.2f,%.2f&format=json",
+        ma->lat - 0.5, ma->lon - 0.5,
+        ma->lat + 0.5, ma->lon + 0.5);
+    free(ma);
+
+    CURL *c = curl_easy_init();
+    if (!c) { pthread_mutex_lock(&gMutex); g_metar_fetching = 0; pthread_mutex_unlock(&gMutex); return NULL; }
+
+    struct Buf b = { (char *)malloc(1), 0 };
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
+    CURLcode rc = curl_easy_perform(c);
+    curl_easy_cleanup(c);
+
+    if (rc == CURLE_OK && b.data) {
+        float dir = parse_field(b.data, "wdir");
+        float spd = parse_field(b.data, "wspd");
+        if (dir >= 0 && spd >= 0) {
+            pthread_mutex_lock(&gMutex);
+            g_dirs[0] = dir; g_spds[0] = spd;
+            g_metar_ready = 1;
+            pthread_mutex_unlock(&gMutex);
+        }
+    }
+    free(b.data);
+    pthread_mutex_lock(&gMutex); g_metar_fetching = 0; pthread_mutex_unlock(&gMutex);
+    return NULL;
+}
+
+// --- Aloft thread: fetches HRRR/ICON, writes layers 1-N ---
+static void *fetch_aloft_thread(void *arg) {
+    AloftArgs *fa = (AloftArgs *)arg;
     char url[640];
     snprintf(url, sizeof(url),
         "https://api.open-meteo.com/v1/forecast"
         "?latitude=%.4f&longitude=%.4f"
-        "&hourly=windspeed_1000hPa,winddirection_1000hPa"
-        ",windspeed_925hPa,winddirection_925hPa"
+        "&hourly=windspeed_925hPa,winddirection_925hPa"
         ",windspeed_850hPa,winddirection_850hPa"
         ",windspeed_700hPa,winddirection_700hPa"
         ",windspeed_500hPa,winddirection_500hPa"
@@ -124,7 +174,7 @@ static void *fetch_thread(void *arg) {
     free(fa);
 
     CURL *c = curl_easy_init();
-    if (!c) { pthread_mutex_lock(&gMutex); g_fetching = 0; pthread_mutex_unlock(&gMutex); return NULL; }
+    if (!c) { pthread_mutex_lock(&gMutex); g_aloft_fetching = 0; pthread_mutex_unlock(&gMutex); return NULL; }
 
     struct Buf b = { (char *)malloc(1), 0 };
     curl_easy_setopt(c, CURLOPT_URL, url);
@@ -137,80 +187,117 @@ static void *fetch_thread(void *arg) {
 
     if (rc == CURLE_OK && b.data) {
         int hi = find_hour_index(b.data);
-        float dirs[NUM_LAYERS], spds[NUM_LAYERS];
+        float dirs[NUM_LAYERS - 1], spds[NUM_LAYERS - 1];
         int ok = 1;
-        for (int i = 0; i < nlayers; i++) {
+        for (int i = 0; i < nlayers - 1; i++) {
             dirs[i] = parse_array_at(b.data, DIR_VARS[i], hi);
             spds[i] = parse_array_at(b.data, SPD_VARS[i], hi);
             if (dirs[i] < 0 || spds[i] < 0) { ok = 0; break; }
         }
         if (ok) {
             pthread_mutex_lock(&gMutex);
-            for (int i = 0; i < nlayers; i++) { g_dirs[i] = dirs[i]; g_spds[i] = spds[i]; }
+            for (int i = 0; i < nlayers - 1; i++) {
+                g_dirs[i + 1] = dirs[i];
+                g_spds[i + 1] = spds[i];
+            }
             g_nlayers = nlayers;
-            g_ready = 1;
+            g_aloft_ready = 1;
             pthread_mutex_unlock(&gMutex);
         }
     }
     free(b.data);
-    pthread_mutex_lock(&gMutex); g_fetching = 0; pthread_mutex_unlock(&gMutex);
+    pthread_mutex_lock(&gMutex); g_aloft_fetching = 0; pthread_mutex_unlock(&gMutex);
     return NULL;
 }
 
-static void spawn_fetch(void) {
-    FetchArgs *fa = (FetchArgs *)malloc(sizeof(FetchArgs));
-    fa->lat  = XPLMGetDatad(gLat);
-    fa->lon  = XPLMGetDatad(gLon);
-    fa->model   = is_conus(fa->lat, fa->lon) ? "gfs_hrrr"      : "icon_seamless";
-    fa->nlayers = is_conus(fa->lat, fa->lon) ? HRRR_LAYERS : NUM_LAYERS;
-    pthread_t t;
-    if (pthread_create(&t, NULL, fetch_thread, fa) == 0) { pthread_detach(t); g_fetching = 1; }
-    else free(fa);
+static void spawn_fetches(void) {
+    double lat = XPLMGetDatad(gLat);
+    double lon = XPLMGetDatad(gLon);
+
+    // METAR surface fetch
+    if (!g_metar_fetching) {
+        MetarArgs *ma = (MetarArgs *)malloc(sizeof(MetarArgs));
+        ma->lat = lat; ma->lon = lon;
+        pthread_t t;
+        if (pthread_create(&t, NULL, fetch_metar_thread, ma) == 0) { pthread_detach(t); g_metar_fetching = 1; }
+        else free(ma);
+    }
+
+    // Aloft fetch
+    if (!g_aloft_fetching) {
+        AloftArgs *fa = (AloftArgs *)malloc(sizeof(AloftArgs));
+        fa->lat     = lat; fa->lon = lon;
+        fa->model   = is_conus(lat, lon) ? "gfs_hrrr"   : "icon_seamless";
+        fa->nlayers = is_conus(lat, lon) ? HRRR_LAYERS  : NUM_LAYERS;
+        pthread_t t;
+        if (pthread_create(&t, NULL, fetch_aloft_thread, fa) == 0) { pthread_detach(t); g_aloft_fetching = 1; }
+        else free(fa);
+    }
 }
 
 static float g_elapsed = 0.0f;
 
 static float loop_cb(float dt, float, int, void *) {
     pthread_mutex_lock(&gMutex);
-    int ready    = g_ready;
-    int fetching = g_fetching;
-    int has_data = g_has_data;
-    int nlayers  = g_nlayers;
+    int aloft_ready   = g_aloft_ready;
+    int metar_ready   = g_metar_ready;
+    int aloft_fetch   = g_aloft_fetching;
+    int metar_fetch   = g_metar_fetching;
+    int has_aloft     = g_has_aloft;
+    int has_metar     = g_has_metar;
+    int nlayers       = g_nlayers;
     float dirs[NUM_LAYERS], spds[NUM_LAYERS];
     for (int i = 0; i < NUM_LAYERS; i++) { dirs[i] = g_dirs[i]; spds[i] = g_spds[i]; }
-    if (ready) { g_ready = 0; g_has_data = 1; has_data = 1; }
+    if (aloft_ready) { g_aloft_ready = 0; g_has_aloft = 1; has_aloft = 1; }
+    if (metar_ready) { g_metar_ready = 0; g_has_metar = 1; has_metar = 1; }
     pthread_mutex_unlock(&gMutex);
 
-    if (ready) {
+    if (aloft_ready || metar_ready) {
         char msg[128];
         snprintf(msg, sizeof(msg),
-            "RealWind: sfc %.0f/%.0fkt  10k %.0f/%.0fkt  30k %.0f/%.0fkt  60k %.0f/%.0fkt\n",
-            dirs[0], spds[0], dirs[3], spds[3], dirs[5], spds[5], dirs[9], spds[9]);
+            "RealWind: sfc %.0f/%.0fkt%s  10k %.0f/%.0fkt  30k %.0f/%.0fkt\n",
+            dirs[0], spds[0], has_metar ? "(METAR)" : "(model)",
+            dirs[3], spds[3], dirs[5], spds[5]);
         XPLMDebugString(msg);
     }
 
-    if (has_data) {
-        for (int i = 0; i < nlayers; i++) {
+    // Inject aloft layers first, then METAR overwrites layer 0
+    if (has_aloft) {
+        for (int i = 1; i < nlayers; i++) {
             XPLMSetDatavf(gWindDir, &dirs[i], i, 1);
             XPLMSetDatavf(gWindSpd, &spds[i], i, 1);
             float alt = LAYER_ALT_M[i];
             XPLMSetDatavf(gWindAlt, &alt, i, 1);
         }
     }
+    if (has_metar) {
+        XPLMSetDatavf(gWindDir, &dirs[0], 0, 1);
+        XPLMSetDatavf(gWindSpd, &spds[0], 0, 1);
+        float alt = 0.0f;
+        XPLMSetDatavf(gWindAlt, &alt, 0, 1);
+    } else if (has_aloft) {
+        // Fall back to model surface if no METAR (oceanic/remote)
+        XPLMSetDatavf(gWindDir, &dirs[1], 0, 1);
+        XPLMSetDatavf(gWindSpd, &spds[1], 0, 1);
+        float alt = 0.0f;
+        XPLMSetDatavf(gWindAlt, &alt, 0, 1);
+    }
 
     g_elapsed += dt;
-    if (!fetching && (!has_data || g_elapsed >= REFRESH_SEC)) {
-        pthread_mutex_lock(&gMutex); spawn_fetch(); pthread_mutex_unlock(&gMutex);
+    int any_fetching = aloft_fetch || metar_fetch;
+    int has_any = has_aloft || has_metar;
+    if (!any_fetching && (!has_any || g_elapsed >= REFRESH_SEC)) {
+        pthread_mutex_lock(&gMutex); spawn_fetches(); pthread_mutex_unlock(&gMutex);
         g_elapsed = 0.0f;
     }
 
-    return has_data ? INJECT_SEC : POLL_SEC;
+    return has_any ? INJECT_SEC : POLL_SEC;
 }
 
 PLUGIN_API int XPluginStart(char *name, char *sig, char *desc) {
     strcpy(name, "RealWind");
     strcpy(sig,  "com.nikhil.realwind");
-    strcpy(desc, "Injects real-world winds aloft into X-Plane 11");
+    strcpy(desc, "Injects real-world winds into X-Plane 11");
 
     gLat     = XPLMFindDataRef("sim/flightmodel/position/latitude");
     gLon     = XPLMFindDataRef("sim/flightmodel/position/longitude");
@@ -226,7 +313,7 @@ PLUGIN_API int XPluginStart(char *name, char *sig, char *desc) {
     for (int i = 0; i < NUM_LAYERS; i++) { g_dirs[i] = -1; g_spds[i] = -1; }
     curl_global_init(CURL_GLOBAL_DEFAULT);
     XPLMRegisterFlightLoopCallback(loop_cb, 1.0f, NULL);
-    XPLMDebugString("RealWind: loaded — HRRR (1h) over CONUS, ICON (3h) global\n");
+    XPLMDebugString("RealWind: loaded — METAR surface + HRRR/ICON aloft\n");
     return 1;
 }
 
