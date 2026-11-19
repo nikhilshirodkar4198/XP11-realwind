@@ -13,6 +13,9 @@ Injects real-world winds aloft into X-Plane 11 via [Open-Meteo](https://open-met
 | 4 | 500 hPa | ~18,000 ft |
 | 5 | 300 hPa | ~30,000 ft |
 | 6 | 200 hPa | ~39,000 ft |
+| 7 | 150 hPa | ~44,600 ft |
+| 8 | 100 hPa | ~53,000 ft |
+| 9 | 70 hPa | ~60,000 ft |
 
 ## How it works
 

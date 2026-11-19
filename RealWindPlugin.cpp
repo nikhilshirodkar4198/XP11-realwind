@@ -13,26 +13,31 @@
 #define REFRESH_SEC 300.0f
 #define INJECT_SEC    2.0f
 #define POLL_SEC     15.0f
-#define NUM_LAYERS      7
+#define NUM_LAYERS     10
 
 // Pressure level → approximate MSL altitude in metres
 static const float LAYER_ALT_M[NUM_LAYERS] = {
-    111.0f,    // 1000 hPa  ~  364 ft
-    762.0f,    //  925 hPa  ~ 2500 ft
-    1524.0f,   //  850 hPa  ~ 5000 ft
-    3048.0f,   //  700 hPa  ~10000 ft
-    5486.0f,   //  500 hPa  ~18000 ft
-    9144.0f,   //  300 hPa  ~30000 ft
-    11887.0f   //  200 hPa  ~39000 ft
+    111.0f,    // 1000 hPa  ~   364 ft
+    762.0f,    //  925 hPa  ~ 2,500 ft
+    1524.0f,   //  850 hPa  ~ 5,000 ft
+    3048.0f,   //  700 hPa  ~10,000 ft
+    5486.0f,   //  500 hPa  ~18,000 ft
+    9144.0f,   //  300 hPa  ~30,000 ft
+    11887.0f,  //  200 hPa  ~39,000 ft
+    13608.0f,  //  150 hPa  ~44,600 ft
+    16180.0f,  //  100 hPa  ~53,000 ft
+    18300.0f   //   70 hPa  ~60,000 ft
 };
 
 static const char *SPD_VARS[NUM_LAYERS] = {
     "windspeed_1000hPa","windspeed_925hPa","windspeed_850hPa",
-    "windspeed_700hPa","windspeed_500hPa","windspeed_300hPa","windspeed_200hPa"
+    "windspeed_700hPa","windspeed_500hPa","windspeed_300hPa",
+    "windspeed_200hPa","windspeed_150hPa","windspeed_100hPa","windspeed_70hPa"
 };
 static const char *DIR_VARS[NUM_LAYERS] = {
     "winddirection_1000hPa","winddirection_925hPa","winddirection_850hPa",
-    "winddirection_700hPa","winddirection_500hPa","winddirection_300hPa","winddirection_200hPa"
+    "winddirection_700hPa","winddirection_500hPa","winddirection_300hPa",
+    "winddirection_200hPa","winddirection_150hPa","winddirection_100hPa","winddirection_70hPa"
 };
 
 static XPLMDataRef gLat, gLon, gWindDir, gWindSpd, gWindAlt;
@@ -103,6 +108,9 @@ static void *fetch_thread(void *arg) {
         ",windspeed_500hPa,winddirection_500hPa"
         ",windspeed_300hPa,winddirection_300hPa"
         ",windspeed_200hPa,winddirection_200hPa"
+        ",windspeed_150hPa,winddirection_150hPa"
+        ",windspeed_100hPa,winddirection_100hPa"
+        ",windspeed_70hPa,winddirection_70hPa"
         "&wind_speed_unit=kn&forecast_days=1&timeformat=unixtime",
         fa->lat, fa->lon);
     free(fa);
@@ -164,8 +172,8 @@ static float loop_cb(float dt, float, int, void *) {
     if (ready) {
         char msg[128];
         snprintf(msg, sizeof(msg),
-            "RealWind: sfc %.0fdeg/%.0fkt  10k %.0fdeg/%.0fkt  18k %.0fdeg/%.0fkt  30k %.0fdeg/%.0fkt\n",
-            dirs[0], spds[0], dirs[3], spds[3], dirs[4], spds[4], dirs[5], spds[5]);
+            "RealWind: sfc %.0f/%.0fkt  10k %.0f/%.0fkt  30k %.0f/%.0fkt  60k %.0f/%.0fkt\n",
+            dirs[0], spds[0], dirs[3], spds[3], dirs[5], spds[5], dirs[9], spds[9]);
         XPLMDebugString(msg);
     }
 
