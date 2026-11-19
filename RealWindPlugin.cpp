@@ -14,13 +14,16 @@
 #define REFRESH_SEC 300.0f
 #define INJECT_SEC    2.0f
 #define POLL_SEC     15.0f
-#define NUM_LAYERS     10
-#define HRRR_LAYERS     9  // HRRR tops at 100 hPa, skip 70 hPa layer
+#define NUM_LAYERS     12  // X-Plane supports 13 max
+#define HRRR_LAYERS    11  // HRRR tops at 100 hPa, skip 70 hPa layer
 
-// Layers 1-9: Open-Meteo pressure levels (HRRR or ICON)
-// Layer 0:    METAR surface observation (overrides model surface)
+// Layer 0:     METAR surface obs (0m)
+// Layers 1-2:  975/950 hPa — fills the low-altitude approach/departure gap
+// Layers 3-11: standard pressure levels up to 70 hPa (~60,000 ft)
 static const float LAYER_ALT_M[NUM_LAYERS] = {
-      0.0f,    // surface  — METAR actual ground obs
+      0.0f,    // surface  — METAR / model-10m
+    244.0f,    //  975 hPa ~   800 ft
+    500.0f,    //  950 hPa ~ 1,600 ft
     762.0f,    //  925 hPa ~ 2,500 ft
    1524.0f,    //  850 hPa ~ 5,000 ft
    3048.0f,    //  700 hPa ~10,000 ft
@@ -32,16 +35,17 @@ static const float LAYER_ALT_M[NUM_LAYERS] = {
   18300.0f     //   70 hPa ~60,000 ft
 };
 
-// Aloft vars start at 925 hPa (index 1); surface handled by METAR
 static const char *SPD_VARS[NUM_LAYERS - 1] = {
-    "windspeed_925hPa","windspeed_850hPa","windspeed_700hPa",
-    "windspeed_500hPa","windspeed_300hPa","windspeed_200hPa",
-    "windspeed_150hPa","windspeed_100hPa","windspeed_70hPa"
+    "windspeed_975hPa","windspeed_950hPa","windspeed_925hPa",
+    "windspeed_850hPa","windspeed_700hPa","windspeed_500hPa",
+    "windspeed_300hPa","windspeed_200hPa","windspeed_150hPa",
+    "windspeed_100hPa","windspeed_70hPa"
 };
 static const char *DIR_VARS[NUM_LAYERS - 1] = {
-    "winddirection_925hPa","winddirection_850hPa","winddirection_700hPa",
-    "winddirection_500hPa","winddirection_300hPa","winddirection_200hPa",
-    "winddirection_150hPa","winddirection_100hPa","winddirection_70hPa"
+    "winddirection_975hPa","winddirection_950hPa","winddirection_925hPa",
+    "winddirection_850hPa","winddirection_700hPa","winddirection_500hPa",
+    "winddirection_300hPa","winddirection_200hPa","winddirection_150hPa",
+    "winddirection_100hPa","winddirection_70hPa"
 };
 
 static XPLMDataRef gLat, gLon, gWindDir, gWindSpd, gWindAlt;
@@ -198,11 +202,13 @@ static void *fetch_metar_thread(void *arg) {
 // --- Aloft thread: fetches HRRR/ICON, writes layers 1-N ---
 static void *fetch_aloft_thread(void *arg) {
     AloftArgs *fa = (AloftArgs *)arg;
-    char url[640];
+    char url[768];
     snprintf(url, sizeof(url),
         "https://api.open-meteo.com/v1/forecast"
         "?latitude=%.4f&longitude=%.4f"
         "&hourly=windspeed_10m,winddirection_10m"
+        ",windspeed_975hPa,winddirection_975hPa"
+        ",windspeed_950hPa,winddirection_950hPa"
         ",windspeed_925hPa,winddirection_925hPa"
         ",windspeed_850hPa,winddirection_850hPa"
         ",windspeed_700hPa,winddirection_700hPa"
