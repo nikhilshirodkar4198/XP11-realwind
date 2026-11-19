@@ -57,8 +57,10 @@ static const char *DIR_VARS[NUM_LAYERS - 1] = {
     "winddirection_100hPa","winddirection_70hPa"
 };
 
+#define METAR_AGL_LIMIT_M 1524.0f  // ~5,000 ft AGL — above this use model-10m for surface
+
 // ---------- X-Plane datarefs ----------
-static XPLMDataRef gLat, gLon, gHeading, gGroundspeed;
+static XPLMDataRef gLat, gLon, gHeading, gGroundspeed, gHeightAGL;
 static XPLMDataRef gWindDir, gWindSpd, gWindAlt, gWindTurb;
 
 // Feedback datarefs (readable by FlyWithLua / DataRef editor)
@@ -320,7 +322,8 @@ static void spawn_fetches(void) {
     double aloft_lat  = ac_lat + (dist_ahead / 60.0) * cos(hdg_rad);
     double aloft_lon  = ac_lon + (dist_ahead / (60.0 * cos(deg2rad(ac_lat)))) * sin(hdg_rad);
 
-    if (!g_metar_fetching) {
+    float agl_m = XPLMGetDataf(gHeightAGL);
+    if (!g_metar_fetching && agl_m < METAR_AGL_LIMIT_M) {
         MetarArgs *ma = (MetarArgs *)malloc(sizeof(MetarArgs));
         ma->lat=ac_lat; ma->lon=ac_lon;
         pthread_t t;
@@ -355,9 +358,11 @@ static float loop_cb(float dt, float, int, void *) {
     if (metar_ready) { g_metar_ready=0; g_has_metar=1; has_metar=1; }
     pthread_mutex_unlock(&gMutex);
 
-    // Determine surface wind source
+    // Determine surface wind source — METAR only used when low enough to matter
+    float agl_m = XPLMGetDataf(gHeightAGL);
     float sfc_dir, sfc_spd; int src;
-    if (has_metar)         { sfc_dir=dirs[0];  sfc_spd=spds[0];  src=1; }
+    if (has_metar && agl_m < METAR_AGL_LIMIT_M)
+                           { sfc_dir=dirs[0];  sfc_spd=spds[0];  src=1; }
     else if (msfc_dir>=0)  { sfc_dir=msfc_dir; sfc_spd=msfc_spd; src=2; }
     else                   { sfc_dir=-1;        sfc_spd=-1;        src=0; }
 
@@ -432,6 +437,7 @@ PLUGIN_API int XPluginStart(char *name, char *sig, char *desc) {
     gLon         = XPLMFindDataRef("sim/flightmodel/position/longitude");
     gHeading     = XPLMFindDataRef("sim/flightmodel/position/psi");
     gGroundspeed = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
+    gHeightAGL   = XPLMFindDataRef("sim/flightmodel/position/y_agl");
     gWindDir     = XPLMFindDataRef("sim/weather/wind_direction_degt");
     gWindSpd     = XPLMFindDataRef("sim/weather/wind_speed_kt");
     gWindAlt     = XPLMFindDataRef("sim/weather/wind_altitude_msl_m");
