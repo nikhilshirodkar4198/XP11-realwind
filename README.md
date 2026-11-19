@@ -1,10 +1,22 @@
 # XP11-RealWind
 
-Injects real-world METAR wind into X-Plane 11 via the [aviationweather.gov](https://aviationweather.gov) API. No API key required.
+Injects real-world winds aloft into X-Plane 11 via [Open-Meteo](https://open-meteo.com). No API key required. Works alongside X-Plane live weather — clouds, visibility, and pressure are untouched.
+
+## Wind layers injected
+
+| Layer | Pressure | Altitude |
+|-------|----------|----------|
+| 0 | 1000 hPa | ~364 ft |
+| 1 | 925 hPa | ~2,500 ft |
+| 2 | 850 hPa | ~5,000 ft |
+| 3 | 700 hPa | ~10,000 ft |
+| 4 | 500 hPa | ~18,000 ft |
+| 5 | 300 hPa | ~30,000 ft |
+| 6 | 200 hPa | ~39,000 ft |
 
 ## How it works
 
-Every 5 minutes the plugin reads the aircraft's lat/lon, queries the nearest METAR station within a 1° bounding box, and writes the surface wind direction and speed to X-Plane's weather datarefs.
+Every 5 minutes the plugin reads the aircraft's lat/lon, queries Open-Meteo for hourly wind forecasts at 7 pressure levels, and re-injects all 7 layers into X-Plane's wind datarefs every 2 seconds to override the sim's own weather updates.
 
 Log output (X-Plane Log.txt): `RealWind: 270 deg @ 15 kts`
 

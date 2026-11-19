@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 #include <pthread.h>
 #include <curl/curl.h>
 
@@ -9,15 +10,36 @@
 #include "XPLMProcessing.h"
 #include "XPLMUtilities.h"
 
-#define REFRESH_SEC   300.0f  // re-fetch METAR interval
-#define INJECT_SEC      2.0f  // re-inject wind interval (beats X-Plane live weather updates)
-#define POLL_SEC       15.0f  // wait interval before first METAR arrives
+#define REFRESH_SEC 300.0f
+#define INJECT_SEC    2.0f
+#define POLL_SEC     15.0f
+#define NUM_LAYERS      7
+
+// Pressure level → approximate MSL altitude in metres
+static const float LAYER_ALT_M[NUM_LAYERS] = {
+    111.0f,    // 1000 hPa  ~  364 ft
+    762.0f,    //  925 hPa  ~ 2500 ft
+    1524.0f,   //  850 hPa  ~ 5000 ft
+    3048.0f,   //  700 hPa  ~10000 ft
+    5486.0f,   //  500 hPa  ~18000 ft
+    9144.0f,   //  300 hPa  ~30000 ft
+    11887.0f   //  200 hPa  ~39000 ft
+};
+
+static const char *SPD_VARS[NUM_LAYERS] = {
+    "windspeed_1000hPa","windspeed_925hPa","windspeed_850hPa",
+    "windspeed_700hPa","windspeed_500hPa","windspeed_300hPa","windspeed_200hPa"
+};
+static const char *DIR_VARS[NUM_LAYERS] = {
+    "winddirection_1000hPa","winddirection_925hPa","winddirection_850hPa",
+    "winddirection_700hPa","winddirection_500hPa","winddirection_300hPa","winddirection_200hPa"
+};
 
 static XPLMDataRef gLat, gLon, gWindDir, gWindSpd, gWindAlt;
 
 static pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
-static float  g_dir = -1, g_spd = -1;
-static int    g_ready = 0, g_fetching = 0;
+static float g_dirs[NUM_LAYERS], g_spds[NUM_LAYERS];
+static int   g_ready = 0, g_fetching = 0, g_has_data = 0;
 
 struct Buf { char *data; size_t size; };
 
@@ -32,27 +54,57 @@ static size_t write_cb(void *ptr, size_t sz, size_t n, void *ud) {
     return total;
 }
 
-// Extract first numeric value for "key": from JSON (handles null/string as -1)
-static float parse_num(const char *json, const char *key) {
-    char k[32]; snprintf(k, sizeof(k), "\"%s\":", key);
+// Return value at index idx inside a JSON array named key
+static float parse_array_at(const char *json, const char *key, int idx) {
+    char k[64]; snprintf(k, sizeof(k), "\"%s\":[", key);
     const char *p = strstr(json, k);
     if (!p) return -1;
     p += strlen(k);
+    for (int i = 0; i < idx; i++) {
+        p = strchr(p, ',');
+        if (!p) return -1;
+        p++;
+    }
     while (*p == ' ') p++;
-    if (*p == '"' || *p == 'n' || *p == 'V') return -1; // "VRB", null
     return (float)atof(p);
+}
+
+// Find hourly index whose unix timestamp bracket contains now
+static int find_hour_index(const char *json) {
+    const char *p = strstr(json, "\"time\":[");
+    if (!p) return 0;
+    p += 8;
+    time_t now = time(NULL);
+    int idx = 0;
+    while (*p && *p != ']') {
+        time_t t = (time_t)atol(p);
+        const char *comma = strchr(p, ',');
+        if (!comma || *(comma + 1) == ']') break;
+        time_t tnext = (time_t)atol(comma + 1);
+        if (now >= t && now < tnext) return idx;
+        idx++;
+        p = comma + 1;
+    }
+    return idx;
 }
 
 typedef struct { double lat, lon; } FetchArgs;
 
 static void *fetch_thread(void *arg) {
     FetchArgs *fa = (FetchArgs *)arg;
-    char url[256];
+    char url[512];
     snprintf(url, sizeof(url),
-        "https://aviationweather.gov/api/data/metar"
-        "?bbox=%.2f,%.2f,%.2f,%.2f&format=json",
-        fa->lat - 0.5, fa->lon - 0.5,
-        fa->lat + 0.5, fa->lon + 0.5);
+        "https://api.open-meteo.com/v1/forecast"
+        "?latitude=%.4f&longitude=%.4f"
+        "&hourly=windspeed_1000hPa,winddirection_1000hPa"
+        ",windspeed_925hPa,winddirection_925hPa"
+        ",windspeed_850hPa,winddirection_850hPa"
+        ",windspeed_700hPa,winddirection_700hPa"
+        ",windspeed_500hPa,winddirection_500hPa"
+        ",windspeed_300hPa,winddirection_300hPa"
+        ",windspeed_200hPa,winddirection_200hPa"
+        "&wind_speed_unit=kn&forecast_days=1&timeformat=unixtime",
+        fa->lat, fa->lon);
     free(fa);
 
     CURL *c = curl_easy_init();
@@ -68,11 +120,18 @@ static void *fetch_thread(void *arg) {
     curl_easy_cleanup(c);
 
     if (rc == CURLE_OK && b.data) {
-        float dir = parse_num(b.data, "wdir");
-        float spd = parse_num(b.data, "wspd");
-        if (dir >= 0 && spd >= 0) {
+        int hi = find_hour_index(b.data);
+        float dirs[NUM_LAYERS], spds[NUM_LAYERS];
+        int ok = 1;
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            dirs[i] = parse_array_at(b.data, DIR_VARS[i], hi);
+            spds[i] = parse_array_at(b.data, SPD_VARS[i], hi);
+            if (dirs[i] < 0 || spds[i] < 0) { ok = 0; break; }
+        }
+        if (ok) {
             pthread_mutex_lock(&gMutex);
-            g_dir = dir; g_spd = spd; g_ready = 1;
+            for (int i = 0; i < NUM_LAYERS; i++) { g_dirs[i] = dirs[i]; g_spds[i] = spds[i]; }
+            g_ready = 1;
             pthread_mutex_unlock(&gMutex);
         }
     }
@@ -86,54 +145,52 @@ static void spawn_fetch(void) {
     fa->lat = XPLMGetDatad(gLat);
     fa->lon = XPLMGetDatad(gLon);
     pthread_t t;
-    if (pthread_create(&t, NULL, fetch_thread, fa) == 0) {
-        pthread_detach(t);
-        g_fetching = 1;
-    } else {
-        free(fa);
-    }
+    if (pthread_create(&t, NULL, fetch_thread, fa) == 0) { pthread_detach(t); g_fetching = 1; }
+    else free(fa);
 }
 
-static float g_elapsed = 0.0f;  // time since last METAR fetch
+static float g_elapsed = 0.0f;
 
-static float loop_cb(float sinceLastCall, float, int, void *) {
+static float loop_cb(float dt, float, int, void *) {
     pthread_mutex_lock(&gMutex);
-    int   ready    = g_ready;
-    int   fetching = g_fetching;
-    float dir      = g_dir;
-    float spd      = g_spd;
-    if (ready) { g_ready = 0; }
+    int ready    = g_ready;
+    int fetching = g_fetching;
+    int has_data = g_has_data;
+    float dirs[NUM_LAYERS], spds[NUM_LAYERS];
+    for (int i = 0; i < NUM_LAYERS; i++) { dirs[i] = g_dirs[i]; spds[i] = g_spds[i]; }
+    if (ready) { g_ready = 0; g_has_data = 1; has_data = 1; }
     pthread_mutex_unlock(&gMutex);
 
-    // Log and cache when fresh METAR data arrives
     if (ready) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "RealWind: updated %.0f deg @ %.0f kts\n", dir, spd);
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "RealWind: sfc %.0fdeg/%.0fkt  10k %.0fdeg/%.0fkt  18k %.0fdeg/%.0fkt  30k %.0fdeg/%.0fkt\n",
+            dirs[0], spds[0], dirs[3], spds[3], dirs[4], spds[4], dirs[5], spds[5]);
         XPLMDebugString(msg);
     }
 
-    // Always inject cached wind at high frequency to override X-Plane live weather
-    if (dir >= 0 && spd >= 0) {
-        XPLMSetDatavf(gWindDir, &dir, 0, 1);
-        XPLMSetDatavf(gWindSpd, &spd, 0, 1);
-        float alt = 0.0f;
-        XPLMSetDatavf(gWindAlt, &alt, 0, 1);
+    if (has_data) {
+        for (int i = 0; i < NUM_LAYERS; i++) {
+            XPLMSetDatavf(gWindDir, &dirs[i], i, 1);
+            XPLMSetDatavf(gWindSpd, &spds[i], i, 1);
+            float alt = LAYER_ALT_M[i];
+            XPLMSetDatavf(gWindAlt, &alt, i, 1);
+        }
     }
 
-    // Trigger a new METAR fetch on startup (no data yet) or every REFRESH_SEC
-    g_elapsed += sinceLastCall;
-    if (!fetching && (dir < 0 || g_elapsed >= REFRESH_SEC)) {
+    g_elapsed += dt;
+    if (!fetching && (!has_data || g_elapsed >= REFRESH_SEC)) {
         pthread_mutex_lock(&gMutex); spawn_fetch(); pthread_mutex_unlock(&gMutex);
         g_elapsed = 0.0f;
     }
 
-    return (dir < 0) ? POLL_SEC : INJECT_SEC;
+    return has_data ? INJECT_SEC : POLL_SEC;
 }
 
 PLUGIN_API int XPluginStart(char *name, char *sig, char *desc) {
     strcpy(name, "RealWind");
     strcpy(sig,  "com.nikhil.realwind");
-    strcpy(desc, "Injects METAR wind into X-Plane 11");
+    strcpy(desc, "Injects real-world winds aloft into X-Plane 11");
 
     gLat     = XPLMFindDataRef("sim/flightmodel/position/latitude");
     gLon     = XPLMFindDataRef("sim/flightmodel/position/longitude");
@@ -146,9 +203,10 @@ PLUGIN_API int XPluginStart(char *name, char *sig, char *desc) {
         return 0;
     }
 
+    for (int i = 0; i < NUM_LAYERS; i++) { g_dirs[i] = -1; g_spds[i] = -1; }
     curl_global_init(CURL_GLOBAL_DEFAULT);
     XPLMRegisterFlightLoopCallback(loop_cb, 1.0f, NULL);
-    XPLMDebugString("RealWind: loaded\n");
+    XPLMDebugString("RealWind: loaded (7 wind layers, Open-Meteo)\n");
     return 1;
 }
 
