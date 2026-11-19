@@ -26,7 +26,7 @@ elseif(WIN32)
     target_link_libraries(RealWind PRIVATE "${XPLANE_SDK}/Libraries/Win/XPLM_64.lib")
 else()
     target_compile_definitions(RealWind PRIVATE LIN=1 IBM=0 APL=0)
-    target_link_libraries(RealWind PRIVATE pthread dl)
+    target_link_libraries(RealWind PRIVATE pthread dl m)
     # X-Plane resolves XPLM symbols at runtime on Linux — no stub needed
 endif()
 

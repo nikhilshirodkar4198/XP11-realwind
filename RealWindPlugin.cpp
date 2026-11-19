@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
 #include <time.h>
 #include <pthread.h>
 #include <curl/curl.h>
@@ -108,22 +109,63 @@ static float parse_field(const char *json, const char *key) {
     return (float)atof(p);
 }
 
+static double deg2rad(double d) { return d * 3.14159265358979 / 180.0; }
+
+// Haversine distance in nm between two lat/lon points
+static double dist_nm(double lat1, double lon1, double lat2, double lon2) {
+    double dlat = deg2rad(lat2 - lat1), dlon = deg2rad(lon2 - lon1);
+    double a = sin(dlat/2)*sin(dlat/2) + cos(deg2rad(lat1))*cos(deg2rad(lat2))*sin(dlon/2)*sin(dlon/2);
+    return 2.0 * atan2(sqrt(a), sqrt(1-a)) * 3440.065; // Earth radius in nm
+}
+
+// Walk the JSON array of METAR objects, return wdir/wspd from the nearest station
+static int nearest_metar(const char *json, double ac_lat, double ac_lon,
+                         float *out_dir, float *out_spd) {
+    double best_dist = 1e9;
+    *out_dir = -1; *out_spd = -1;
+    const char *p = json;
+    while ((p = strstr(p, "\"lat\":")) != NULL) {
+        double slat = atof(p + 6);
+        const char *q = strstr(p, "\"lon\":");
+        if (!q) break;
+        double slon = atof(q + 6);
+        double d = dist_nm(ac_lat, ac_lon, slat, slon);
+        if (d < best_dist) {
+            // Scan forward within this object for wdir/wspd
+            const char *obj_end = strchr(p, '}');
+            if (!obj_end) obj_end = p + 2048;
+            char tmp[2048]; int len = (int)(obj_end - p + 1);
+            if (len > (int)sizeof(tmp) - 1) len = sizeof(tmp) - 1;
+            strncpy(tmp, p, len); tmp[len] = 0;
+            float dir = -1, spd = -1;
+            const char *wd = strstr(tmp, "\"wdir\":");
+            const char *ws = strstr(tmp, "\"wspd\":");
+            if (wd) { wd += 7; while(*wd==' ')wd++; if(*wd!='"'&&*wd!='n'&&*wd!='V') dir=(float)atof(wd); }
+            if (ws) { ws += 7; while(*ws==' ')ws++; if(*ws!='"'&&*ws!='n') spd=(float)atof(ws); }
+            if (dir >= 0 && spd >= 0) { best_dist = d; *out_dir = dir; *out_spd = spd; }
+        }
+        p++;
+    }
+    return (*out_dir >= 0 && *out_spd >= 0) ? 1 : 0;
+}
+
 static int is_conus(double lat, double lon) {
     return lat >= 24.0 && lat <= 50.0 && lon >= -125.0 && lon <= -65.0;
 }
 
 typedef struct { double lat, lon; const char *model; int nlayers; } AloftArgs;
-typedef struct { double lat, lon; } MetarArgs;
+typedef struct { double lat, lon; } MetarArgs; // lat/lon = aircraft position
 
 // --- METAR thread: fetches surface obs, writes layer 0 ---
 static void *fetch_metar_thread(void *arg) {
     MetarArgs *ma = (MetarArgs *)arg;
+    double ac_lat = ma->lat, ac_lon = ma->lon;
     char url[256];
     snprintf(url, sizeof(url),
         "https://aviationweather.gov/api/data/metar"
         "?bbox=%.2f,%.2f,%.2f,%.2f&format=json",
-        ma->lat - 0.5, ma->lon - 0.5,
-        ma->lat + 0.5, ma->lon + 0.5);
+        ac_lat - 0.5, ac_lon - 0.5,
+        ac_lat + 0.5, ac_lon + 0.5);
     free(ma);
 
     CURL *c = curl_easy_init();
@@ -139,8 +181,8 @@ static void *fetch_metar_thread(void *arg) {
     curl_easy_cleanup(c);
 
     if (rc == CURLE_OK && b.data) {
-        float dir = parse_field(b.data, "wdir");
-        float spd = parse_field(b.data, "wspd");
+        float dir, spd;
+        nearest_metar(b.data, ac_lat, ac_lon, &dir, &spd);
         if (dir >= 0 && spd >= 0) {
             pthread_mutex_lock(&gMutex);
             g_dirs[0] = dir; g_spds[0] = spd;
