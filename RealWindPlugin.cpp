@@ -3,13 +3,15 @@
 #include <stdio.h>
 #include <math.h>
 #include <time.h>
-#include <pthread.h>
-#include <curl/curl.h>
 
 #ifdef _WIN32
 #  include <windows.h>
+#  include <winhttp.h>
+#  include <process.h>
 static void msleep(int ms) { Sleep(ms); }
 #else
+#  include <pthread.h>
+#  include <curl/curl.h>
 static void msleep(int ms) {
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
@@ -24,7 +26,7 @@ static void msleep(int ms) {
 #define REFRESH_SEC     300.0f
 #define INJECT_SEC        2.0f
 #define POLL_SEC         15.0f
-#define NUM_LAYERS         12   // X-Plane max is 13
+#define NUM_LAYERS         12   // fetched levels; 3 of them are injected at a time
 #define HRRR_LAYERS        11   // HRRR tops at 100 hPa, skip 70 hPa
 #define METAR_MAX_AGE    3600   // reject METARs older than 60 min
 
@@ -60,8 +62,11 @@ static const char *DIR_VARS[NUM_LAYERS - 1] = {
 #define METAR_AGL_LIMIT_M 1524.0f  // ~5,000 ft AGL — above this use model-10m for surface
 
 // ---------- X-Plane datarefs ----------
-static XPLMDataRef gLat, gLon, gHeading, gGroundspeed, gHeightAGL;
-static XPLMDataRef gWindDir, gWindSpd, gWindAlt, gWindTurb;
+#define XP_WIND_LAYERS 3   // XP11: separate sim/weather/wind_*[0..2] datarefs
+
+static XPLMDataRef gLat, gLon, gHeading, gGroundspeed, gHeightAGL, gElevMSL;
+static XPLMDataRef gWindAltL[XP_WIND_LAYERS], gWindDirL[XP_WIND_LAYERS], gWindSpdL[XP_WIND_LAYERS];
+static XPLMDataRef gTurb0;
 
 // Feedback datarefs (readable by FlyWithLua / DataRef editor)
 static XPLMDataRef gDRSurfaceSource = NULL; // 0=none 1=METAR 2=model-10m
@@ -69,7 +74,15 @@ static XPLMDataRef gDRMetarAge      = NULL; // seconds since METAR obsTime
 static XPLMDataRef gDRAloftAge      = NULL; // seconds since last aloft fetch
 
 // ---------- Shared state ----------
+#ifdef _WIN32
+static SRWLOCK gMutex = SRWLOCK_INIT;
+static void lock(void)   { AcquireSRWLockExclusive(&gMutex); }
+static void unlock(void) { ReleaseSRWLockExclusive(&gMutex); }
+#else
 static pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
+static void lock(void)   { pthread_mutex_lock(&gMutex); }
+static void unlock(void) { pthread_mutex_unlock(&gMutex); }
+#endif
 
 static float  g_dirs[NUM_LAYERS], g_spds[NUM_LAYERS];
 static int    g_nlayers         = NUM_LAYERS;
@@ -99,6 +112,88 @@ static size_t write_cb(void *ptr, size_t sz, size_t n, void *ud) {
     return total;
 }
 
+// ---------- HTTP GET: WinHTTP on Windows, libcurl elsewhere. Returns 1 on success ----------
+#ifdef _WIN32
+static int http_get(const char *url, struct Buf *b) {
+    wchar_t wurl[1024];
+    if (!MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, 1024)) return 0;
+
+    URL_COMPONENTS uc; memset(&uc, 0, sizeof(uc));
+    uc.dwStructSize = sizeof(uc);
+    wchar_t host[256], path[1024];
+    uc.lpszHostName = host; uc.dwHostNameLength = 256;
+    uc.lpszUrlPath  = path; uc.dwUrlPathLength  = 1024;
+    uc.dwExtraInfoLength = (DWORD)-1;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) return 0;
+    // Query string comes back separately; WinHTTP wants it as part of the object path
+    if (uc.lpszExtraInfo) wcsncat_s(path, 1024, uc.lpszExtraInfo, _TRUNCATE);
+
+    int ok = 0;
+    HINTERNET s = WinHttpOpen(L"RealWind/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s) return 0;
+    WinHttpSetTimeouts(s, 2500, 2500, 2500, 2500);  // per phase; keeps a fetch inside XPluginStop's 12s wait
+    HINTERNET c = WinHttpConnect(s, host, uc.nPort, 0);
+    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                          WINHTTP_DEFAULT_ACCEPT_TYPES,
+                          uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : NULL;
+    if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+          && WinHttpReceiveResponse(r, NULL)) {
+        DWORD status = 0, sl = sizeof(status);
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sl, WINHTTP_NO_HEADER_INDEX);
+        ok = (status == 200);
+        char chunk[8192]; DWORD got;
+        while (ok && WinHttpReadData(r, chunk, sizeof(chunk), &got) && got > 0)
+            if (write_cb(chunk, 1, got, b) != got) ok = 0;
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    WinHttpCloseHandle(s);
+    return ok;
+}
+#else
+static int http_get(const char *url, struct Buf *b) {
+    CURL *c = curl_easy_init();
+    if (!c) return 0;
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, b);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
+    CURLcode rc = curl_easy_perform(c);
+    curl_easy_cleanup(c);
+    return rc == CURLE_OK;
+}
+#endif
+
+// ---------- Detached thread start. Returns 1 on success ----------
+typedef void *(*thread_fn)(void *);
+#ifdef _WIN32
+typedef struct { thread_fn fn; void *arg; } ThreadStart;
+static unsigned __stdcall thread_trampoline(void *p) {
+    ThreadStart s = *(ThreadStart *)p; free(p);
+    s.fn(s.arg);
+    return 0;
+}
+static int start_thread(thread_fn fn, void *arg) {
+    ThreadStart *s = (ThreadStart *)malloc(sizeof(ThreadStart));
+    if (!s) return 0;
+    s->fn = fn; s->arg = arg;
+    uintptr_t h = _beginthreadex(NULL, 0, thread_trampoline, s, 0, NULL);
+    if (!h) { free(s); return 0; }
+    CloseHandle((HANDLE)h);
+    return 1;
+}
+#else
+static int start_thread(thread_fn fn, void *arg) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, fn, arg) != 0) return 0;
+    pthread_detach(t);
+    return 1;
+}
+#endif
+
 // ---------- JSON helpers ----------
 static float parse_array_at(const char *json, const char *key, int idx) {
     char k[64]; snprintf(k, sizeof(k), "\"%s\":[", key);
@@ -121,10 +216,10 @@ static int find_hour_index(const char *json) {
     time_t now = time(NULL);
     int idx = 0;
     while (*p && *p != ']') {
-        time_t t = (time_t)atol(p);
+        time_t t = (time_t)strtoll(p, NULL, 10);
         const char *c = strchr(p, ',');
         if (!c || *(c+1) == ']') break;
-        if (now >= t && now < (time_t)atol(c+1)) return idx;
+        if (now >= t && now < (time_t)strtoll(c+1, NULL, 10)) return idx;
         idx++; p = c + 1;
     }
     return idx;
@@ -176,7 +271,7 @@ static void nearest_metar(const char *json, double ac_lat, double ac_lon,
             if ((f=strstr(tmp,"\"wdir\":"))  && f[7]!='"'&&f[7]!='n'&&f[7]!='V') td=(float)atof(f+7);
             if ((f=strstr(tmp,"\"wspd\":"))  && f[7]!='"'&&f[7]!='n')             ts=(float)atof(f+7);
             if ((f=strstr(tmp,"\"wgst\":"))  && f[7]!='"'&&f[7]!='n')             tg=(float)atof(f+7);
-            if ((f=strstr(tmp,"\"obsTime\":")))                                    to=(time_t)atol(f+10);
+            if ((f=strstr(tmp,"\"obsTime\":")))                                    to=(time_t)strtoll(f+10, NULL, 10);
             if (td >= 0 && ts >= 0) { best=d; *dir=td; *spd=ts; *gust=tg; *obs=to; }
         }
         p++;
@@ -185,10 +280,10 @@ static void nearest_metar(const char *json, double ac_lat, double ac_lon,
 
 // ---------- Thread lifecycle helpers ----------
 static void thread_enter(void) {
-    pthread_mutex_lock(&gMutex); g_active_threads++; pthread_mutex_unlock(&gMutex);
+    lock(); g_active_threads++; unlock();
 }
 static void thread_exit(void) {
-    pthread_mutex_lock(&gMutex); g_active_threads--; pthread_mutex_unlock(&gMutex);
+    lock(); g_active_threads--; unlock();
 }
 
 // ---------- Arg structs ----------
@@ -202,8 +297,8 @@ static void *fetch_metar_thread(void *arg) {
     free(ma);
     thread_enter();
 
-    pthread_mutex_lock(&gMutex); int shut = g_shutdown; pthread_mutex_unlock(&gMutex);
-    if (shut) { pthread_mutex_lock(&gMutex); g_metar_fetching=0; pthread_mutex_unlock(&gMutex); thread_exit(); return NULL; }
+    lock(); int shut = g_shutdown; unlock();
+    if (shut) { lock(); g_metar_fetching=0; unlock(); thread_exit(); return NULL; }
 
     char url[256];
     snprintf(url, sizeof(url),
@@ -211,34 +306,25 @@ static void *fetch_metar_thread(void *arg) {
         "?bbox=%.2f,%.2f,%.2f,%.2f&format=json",
         ac_lat-0.5, ac_lon-0.5, ac_lat+0.5, ac_lon+0.5);
 
-    CURL *c = curl_easy_init();
-    if (!c) { pthread_mutex_lock(&gMutex); g_metar_fetching=0; pthread_mutex_unlock(&gMutex); thread_exit(); return NULL; }
-
     struct Buf b = { (char *)malloc(1), 0 };
-    curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
-    CURLcode rc = curl_easy_perform(c);
-    curl_easy_cleanup(c);
+    int ok = http_get(url, &b);
 
-    if (rc == CURLE_OK && b.data) {
+    if (ok && b.data) {
         float dir, spd, gust; time_t obs;
         nearest_metar(b.data, ac_lat, ac_lon, &dir, &spd, &gust, &obs);
         // Discard stale METAR
         if (dir >= 0 && obs > 0 && (time(NULL) - obs) > METAR_MAX_AGE)
             dir = spd = gust = -1;
         if (dir >= 0 && spd >= 0) {
-            pthread_mutex_lock(&gMutex);
+            lock();
             g_dirs[0]=dir; g_spds[0]=spd;
             g_metar_gust=gust; g_metar_obs_time=obs;
             g_metar_ready=1;
-            pthread_mutex_unlock(&gMutex);
+            unlock();
         }
     }
     free(b.data);
-    pthread_mutex_lock(&gMutex); g_metar_fetching=0; pthread_mutex_unlock(&gMutex);
+    lock(); g_metar_fetching=0; unlock();
     thread_exit();
     return NULL;
 }
@@ -250,8 +336,8 @@ static void *fetch_aloft_thread(void *arg) {
     free(fa);
     thread_enter();
 
-    pthread_mutex_lock(&gMutex); int shut=g_shutdown; pthread_mutex_unlock(&gMutex);
-    if (shut) { pthread_mutex_lock(&gMutex); g_aloft_fetching=0; pthread_mutex_unlock(&gMutex); thread_exit(); return NULL; }
+    lock(); int shut=g_shutdown; unlock();
+    if (shut) { lock(); g_aloft_fetching=0; unlock(); thread_exit(); return NULL; }
 
     char url[768];
     snprintf(url, sizeof(url),
@@ -272,19 +358,10 @@ static void *fetch_aloft_thread(void *arg) {
         "&wind_speed_unit=kn&forecast_days=1&timeformat=unixtime&models=%s",
         lat, lon, model);
 
-    CURL *c = curl_easy_init();
-    if (!c) { pthread_mutex_lock(&gMutex); g_aloft_fetching=0; pthread_mutex_unlock(&gMutex); thread_exit(); return NULL; }
-
     struct Buf b = { (char *)malloc(1), 0 };
-    curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
-    CURLcode rc = curl_easy_perform(c);
-    curl_easy_cleanup(c);
+    int http_ok = http_get(url, &b);
 
-    if (rc == CURLE_OK && b.data) {
+    if (http_ok && b.data) {
         int hi = find_hour_index(b.data);
         float msfc_dir = parse_array_at(b.data, "winddirection_10m", hi);
         float msfc_spd = parse_array_at(b.data, "windspeed_10m",     hi);
@@ -296,15 +373,15 @@ static void *fetch_aloft_thread(void *arg) {
             if (dirs[i] < 0 || spds[i] < 0) { ok=0; break; }
         }
         if (ok) {
-            pthread_mutex_lock(&gMutex);
+            lock();
             for (int i = 0; i < nlayers-1; i++) { g_dirs[i+1]=dirs[i]; g_spds[i+1]=spds[i]; }
             if (msfc_dir >= 0) { g_model_sfc_dir=msfc_dir; g_model_sfc_spd=msfc_spd; }
             g_nlayers=nlayers; g_aloft_ready=1; g_aloft_fetch_time=time(NULL);
-            pthread_mutex_unlock(&gMutex);
+            unlock();
         }
     }
     free(b.data);
-    pthread_mutex_lock(&gMutex); g_aloft_fetching=0; pthread_mutex_unlock(&gMutex);
+    lock(); g_aloft_fetching=0; unlock();
     thread_exit();
     return NULL;
 }
@@ -326,8 +403,7 @@ static void spawn_fetches(void) {
     if (!g_metar_fetching && agl_m < METAR_AGL_LIMIT_M) {
         MetarArgs *ma = (MetarArgs *)malloc(sizeof(MetarArgs));
         ma->lat=ac_lat; ma->lon=ac_lon;
-        pthread_t t;
-        if (pthread_create(&t, NULL, fetch_metar_thread, ma)==0) { pthread_detach(t); g_metar_fetching=1; }
+        if (start_thread(fetch_metar_thread, ma)) g_metar_fetching=1;
         else free(ma);
     }
 
@@ -336,8 +412,7 @@ static void spawn_fetches(void) {
         fa->lat=aloft_lat; fa->lon=aloft_lon;
         fa->model   = is_conus(aloft_lat,aloft_lon) ? "gfs_hrrr"  : "icon_seamless";
         fa->nlayers = is_conus(aloft_lat,aloft_lon) ? HRRR_LAYERS : NUM_LAYERS;
-        pthread_t t;
-        if (pthread_create(&t, NULL, fetch_aloft_thread, fa)==0) { pthread_detach(t); g_aloft_fetching=1; }
+        if (start_thread(fetch_aloft_thread, fa)) g_aloft_fetching=1;
         else free(fa);
     }
 }
@@ -346,7 +421,7 @@ static void spawn_fetches(void) {
 static float g_elapsed = 0.0f;
 
 static float loop_cb(float dt, float, int, void *) {
-    pthread_mutex_lock(&gMutex);
+    lock();
     int aloft_ready=g_aloft_ready, metar_ready=g_metar_ready;
     int aloft_fetch=g_aloft_fetching, metar_fetch=g_metar_fetching;
     int has_aloft=g_has_aloft, has_metar=g_has_metar;
@@ -356,7 +431,7 @@ static float loop_cb(float dt, float, int, void *) {
     for (int i=0;i<NUM_LAYERS;i++) { dirs[i]=g_dirs[i]; spds[i]=g_spds[i]; }
     if (aloft_ready) { g_aloft_ready=0; g_has_aloft=1; has_aloft=1; }
     if (metar_ready) { g_metar_ready=0; g_has_metar=1; has_metar=1; }
-    pthread_mutex_unlock(&gMutex);
+    unlock();
 
     // Determine surface wind source — METAR only used when low enough to matter
     float agl_m = XPLMGetDataf(gHeightAGL);
@@ -366,7 +441,7 @@ static float loop_cb(float dt, float, int, void *) {
     else if (msfc_dir>=0)  { sfc_dir=msfc_dir; sfc_spd=msfc_spd; src=2; }
     else                   { sfc_dir=-1;        sfc_spd=-1;        src=0; }
 
-    pthread_mutex_lock(&gMutex); g_surface_source=src; pthread_mutex_unlock(&gMutex);
+    lock(); g_surface_source=src; unlock();
 
     if (aloft_ready || metar_ready) {
         char msg[128];
@@ -377,38 +452,52 @@ static float loop_cb(float dt, float, int, void *) {
         XPLMDebugString(msg);
     }
 
+    // XP11 has 3 wind layers: 0 = surface, 1/2 = the fetched levels bracketing the aircraft.
+    // X-Plane interpolates between layers, so wind at the aircraft is always real data, and
+    // re-picking the bracket on a level crossing is seamless (that level's wind is shared).
+    double alt_msl = XPLMGetDatad(gElevMSL);
+    float  gnd_msl = (float)(alt_msl - agl_m);
+
     if (has_aloft) {
         // Blend layers 1-2 toward surface to smooth METAR→model discontinuity
         if (sfc_dir >= 0) {
             dirs[1]=blend_dir(dirs[1],sfc_dir,0.33f); spds[1]=spds[1]*0.67f+sfc_spd*0.33f;
             dirs[2]=blend_dir(dirs[2],sfc_dir,0.17f); spds[2]=spds[2]*0.83f+sfc_spd*0.17f;
         }
-        for (int i=1; i<nlayers; i++) {
-            XPLMSetDatavf(gWindDir, &dirs[i], i, 1);
-            XPLMSetDatavf(gWindSpd, &spds[i], i, 1);
-            float alt=LAYER_ALT_M[i]; XPLMSetDatavf(gWindAlt, &alt, i, 1);
+        // Lowest level above the ground: high-elevation airports sit above 975/950 hPa
+        int first = 1;
+        while (first < nlayers-2 && LAYER_ALT_M[first] <= gnd_msl + 30.0f) first++;
+        int lo = first;
+        while (lo < nlayers-2 && LAYER_ALT_M[lo+1] <= alt_msl) lo++;
+        int pick[2] = { lo, lo+1 };
+        for (int k=0; k<2; k++) {
+            int i = pick[k];
+            float alt = LAYER_ALT_M[i];
+            XPLMSetDataf(gWindAltL[k+1], alt);
+            XPLMSetDataf(gWindDirL[k+1], dirs[i]);
+            XPLMSetDataf(gWindSpdL[k+1], spds[i]);
         }
     }
 
     if (sfc_dir >= 0) {
-        XPLMSetDatavf(gWindDir, &sfc_dir, 0, 1);
-        XPLMSetDatavf(gWindSpd, &sfc_spd, 0, 1);
-        float alt=0.0f; XPLMSetDatavf(gWindAlt, &alt, 0, 1);
+        XPLMSetDataf(gWindAltL[0], gnd_msl > 0.0f ? gnd_msl : 0.0f);
+        XPLMSetDataf(gWindDirL[0], sfc_dir);
+        XPLMSetDataf(gWindSpdL[0], sfc_spd);
 
-        // Inject gust as surface turbulence (METAR only)
-        if (gWindTurb) {
+        // Inject gust as surface-layer turbulence (METAR only), 0-10 scale
+        if (gTurb0) {
             float turb=0.0f;
             if (src==1 && mgust > sfc_spd) {
-                turb = (mgust - sfc_spd) / 15.0f;
-                if (turb > 1.0f) turb = 1.0f;
+                turb = (mgust - sfc_spd) / 15.0f * 10.0f;
+                if (turb > 10.0f) turb = 10.0f;
             }
-            XPLMSetDatavf(gWindTurb, &turb, 0, 1);
+            XPLMSetDataf(gTurb0, turb);
         }
     }
 
     g_elapsed += dt;
     if (!(aloft_fetch||metar_fetch) && (!( has_aloft||has_metar) || g_elapsed>=REFRESH_SEC)) {
-        pthread_mutex_lock(&gMutex); spawn_fetches(); pthread_mutex_unlock(&gMutex);
+        lock(); spawn_fetches(); unlock();
         g_elapsed=0.0f;
     }
     return (has_aloft||has_metar) ? INJECT_SEC : POLL_SEC;
@@ -416,14 +505,14 @@ static float loop_cb(float dt, float, int, void *) {
 
 // ---------- Feedback dataref callbacks ----------
 static float cb_surface_source(void *r) {
-    pthread_mutex_lock(&gMutex); float v=(float)g_surface_source; pthread_mutex_unlock(&gMutex); return v;
+    lock(); float v=(float)g_surface_source; unlock(); return v;
 }
 static float cb_metar_age(void *r) {
-    pthread_mutex_lock(&gMutex); time_t t=g_metar_obs_time; pthread_mutex_unlock(&gMutex);
+    lock(); time_t t=g_metar_obs_time; unlock();
     return t ? (float)(time(NULL)-t) : -1.0f;
 }
 static float cb_aloft_age(void *r) {
-    pthread_mutex_lock(&gMutex); time_t t=g_aloft_fetch_time; pthread_mutex_unlock(&gMutex);
+    lock(); time_t t=g_aloft_fetch_time; unlock();
     return t ? (float)(time(NULL)-t) : -1.0f;
 }
 
@@ -438,17 +527,26 @@ PLUGIN_API int XPluginStart(char *name, char *sig, char *desc) {
     gHeading     = XPLMFindDataRef("sim/flightmodel/position/psi");
     gGroundspeed = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
     gHeightAGL   = XPLMFindDataRef("sim/flightmodel/position/y_agl");
-    gWindDir     = XPLMFindDataRef("sim/weather/wind_direction_degt");
-    gWindSpd     = XPLMFindDataRef("sim/weather/wind_speed_kt");
-    gWindAlt     = XPLMFindDataRef("sim/weather/wind_altitude_msl_m");
-    gWindTurb    = XPLMFindDataRef("sim/weather/wind_turbulence_percent");
+    gElevMSL     = XPLMFindDataRef("sim/flightmodel/position/elevation");
+    gTurb0       = XPLMFindDataRef("sim/weather/turbulence[0]");
 
-    if (!gLat||!gLon||!gWindDir||!gWindSpd||!gWindAlt) {
+    int ok = gLat && gLon && gHeading && gGroundspeed && gHeightAGL && gElevMSL;
+    for (int k=0; k<XP_WIND_LAYERS; k++) {
+        char n[64];
+        snprintf(n, sizeof(n), "sim/weather/wind_altitude_msl_m[%d]", k); gWindAltL[k] = XPLMFindDataRef(n);
+        snprintf(n, sizeof(n), "sim/weather/wind_direction_degt[%d]", k); gWindDirL[k] = XPLMFindDataRef(n);
+        snprintf(n, sizeof(n), "sim/weather/wind_speed_kt[%d]",       k); gWindSpdL[k] = XPLMFindDataRef(n);
+        ok = ok && gWindAltL[k] && gWindDirL[k] && gWindSpdL[k];
+    }
+
+    if (!ok) {
         XPLMDebugString("RealWind: missing required datarefs\n"); return 0;
     }
 
     for (int i=0;i<NUM_LAYERS;i++) { g_dirs[i]=-1; g_spds[i]=-1; }
+#ifndef _WIN32
     curl_global_init(CURL_GLOBAL_DEFAULT);
+#endif
     XPLMRegisterFlightLoopCallback(loop_cb, 1.0f, NULL);
 
     gDRSurfaceSource = XPLMRegisterDataAccessor("realwind/surface_source",
@@ -469,14 +567,16 @@ PLUGIN_API void XPluginStop(void) {
     XPLMUnregisterFlightLoopCallback(loop_cb, NULL);
 
     // Signal threads to exit, wait up to 12s (curl timeout is 10s)
-    pthread_mutex_lock(&gMutex); g_shutdown=1; pthread_mutex_unlock(&gMutex);
+    lock(); g_shutdown=1; unlock();
     for (int i=0; i<120; i++) {
-        pthread_mutex_lock(&gMutex); int active=g_active_threads; pthread_mutex_unlock(&gMutex);
+        lock(); int active=g_active_threads; unlock();
         if (active==0) break;
         msleep(100);
     }
 
+#ifndef _WIN32
     curl_global_cleanup();
+#endif
 
     if (gDRSurfaceSource) XPLMUnregisterDataAccessor(gDRSurfaceSource);
     if (gDRMetarAge)      XPLMUnregisterDataAccessor(gDRMetarAge);
@@ -485,4 +585,4 @@ PLUGIN_API void XPluginStop(void) {
 
 PLUGIN_API int  XPluginEnable(void)                           { return 1; }
 PLUGIN_API void XPluginDisable(void)                          {}
-PLUGIN_API void XPLMReceiveMessage(XPLMPluginID, int, void *) {}
+PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int, void *) {}
