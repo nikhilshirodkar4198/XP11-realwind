@@ -25,20 +25,11 @@ Log output (X-Plane Log.txt): `RealWind: 270 deg @ 15 kts`
 
 ## Install (macOS)
 
-No build tools required — a pre-built universal binary (arm64 + x86_64) is included.
+1. [Download this repo as a ZIP](https://github.com/nikhilshirodkar4198/XP11-realwind/archive/refs/heads/main.zip)
+2. Extract it
+3. Drag the `RealWind` folder into `X-Plane 11/Resources/plugins/`
 
-```sh
-git clone https://github.com/nikhilshirodkar4198/XP11-realwind.git
-cd XP11-realwind
-./install.sh
-```
-
-The script finds your X-Plane 11 installation automatically and copies the plugin in.
-
-**Or manually:** copy `RealWind.xpl` to:
-```
-X-Plane 11/Resources/plugins/RealWind/64/mac.xpl
-```
+Done. Launch X-Plane normally — plugins load automatically.
 
 ## Verify
 
