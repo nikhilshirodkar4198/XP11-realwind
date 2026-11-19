@@ -51,6 +51,7 @@ static int   g_aloft_ready = 0, g_aloft_fetching = 0;
 static int   g_metar_ready = 0, g_metar_fetching = 0;
 static int   g_has_aloft = 0,   g_has_metar = 0;
 static int   g_nlayers = NUM_LAYERS;
+static float g_model_sfc_dir = -1, g_model_sfc_spd = -1; // 10m AGL from model
 
 struct Buf { char *data; size_t size; };
 
@@ -159,7 +160,8 @@ static void *fetch_aloft_thread(void *arg) {
     snprintf(url, sizeof(url),
         "https://api.open-meteo.com/v1/forecast"
         "?latitude=%.4f&longitude=%.4f"
-        "&hourly=windspeed_925hPa,winddirection_925hPa"
+        "&hourly=windspeed_10m,winddirection_10m"
+        ",windspeed_925hPa,winddirection_925hPa"
         ",windspeed_850hPa,winddirection_850hPa"
         ",windspeed_700hPa,winddirection_700hPa"
         ",windspeed_500hPa,winddirection_500hPa"
@@ -194,11 +196,17 @@ static void *fetch_aloft_thread(void *arg) {
             spds[i] = parse_array_at(b.data, SPD_VARS[i], hi);
             if (dirs[i] < 0 || spds[i] < 0) { ok = 0; break; }
         }
+        float msfc_dir = parse_array_at(b.data, "winddirection_10m", hi);
+        float msfc_spd = parse_array_at(b.data, "windspeed_10m",    hi);
         if (ok) {
             pthread_mutex_lock(&gMutex);
             for (int i = 0; i < nlayers - 1; i++) {
                 g_dirs[i + 1] = dirs[i];
                 g_spds[i + 1] = spds[i];
+            }
+            if (msfc_dir >= 0 && msfc_spd >= 0) {
+                g_model_sfc_dir = msfc_dir;
+                g_model_sfc_spd = msfc_spd;
             }
             g_nlayers = nlayers;
             g_aloft_ready = 1;
@@ -246,6 +254,8 @@ static float loop_cb(float dt, float, int, void *) {
     int has_aloft     = g_has_aloft;
     int has_metar     = g_has_metar;
     int nlayers       = g_nlayers;
+    float model_sfc_dir = g_model_sfc_dir;
+    float model_sfc_spd = g_model_sfc_spd;
     float dirs[NUM_LAYERS], spds[NUM_LAYERS];
     for (int i = 0; i < NUM_LAYERS; i++) { dirs[i] = g_dirs[i]; spds[i] = g_spds[i]; }
     if (aloft_ready) { g_aloft_ready = 0; g_has_aloft = 1; has_aloft = 1; }
@@ -254,9 +264,11 @@ static float loop_cb(float dt, float, int, void *) {
 
     if (aloft_ready || metar_ready) {
         char msg[128];
+        float sfc_d = has_metar ? dirs[0] : model_sfc_dir;
+        float sfc_s = has_metar ? spds[0] : model_sfc_spd;
         snprintf(msg, sizeof(msg),
-            "RealWind: sfc %.0f/%.0fkt%s  10k %.0f/%.0fkt  30k %.0f/%.0fkt\n",
-            dirs[0], spds[0], has_metar ? "(METAR)" : "(model)",
+            "RealWind: sfc %.0f/%.0fkt(%s)  10k %.0f/%.0fkt  30k %.0f/%.0fkt\n",
+            sfc_d, sfc_s, has_metar ? "METAR" : "model-10m",
             dirs[3], spds[3], dirs[5], spds[5]);
         XPLMDebugString(msg);
     }
@@ -275,10 +287,10 @@ static float loop_cb(float dt, float, int, void *) {
         XPLMSetDatavf(gWindSpd, &spds[0], 0, 1);
         float alt = 0.0f;
         XPLMSetDatavf(gWindAlt, &alt, 0, 1);
-    } else if (has_aloft) {
-        // Fall back to model surface if no METAR (oceanic/remote)
-        XPLMSetDatavf(gWindDir, &dirs[1], 0, 1);
-        XPLMSetDatavf(gWindSpd, &spds[1], 0, 1);
+    } else if (has_aloft && model_sfc_dir >= 0) {
+        // No METAR (remote/oceanic) — use model 10m AGL wind
+        XPLMSetDatavf(gWindDir, &model_sfc_dir, 0, 1);
+        XPLMSetDatavf(gWindSpd, &model_sfc_spd, 0, 1);
         float alt = 0.0f;
         XPLMSetDatavf(gWindAlt, &alt, 0, 1);
     }
