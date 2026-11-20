@@ -255,17 +255,19 @@ static void nearest_metar(const char *json, double ac_lat, double ac_lon,
                            float *dir, float *spd, float *gust, time_t *obs) {
     *dir = *spd = *gust = -1; *obs = 0;
     double best = 1e9;
-    const char *p = json;
-    while ((p = strstr(p, "\"lat\":")) != NULL) {
-        double slat = atof(p + 6);
-        const char *q = strstr(p, "\"lon\":"); if (!q) break;
-        double slon = atof(q + 6);
-        double d = dist_nm(ac_lat, ac_lon, slat, slon);
+    // One station record runs from its "icaoId" to the next one; wind/obsTime come before lat/lon
+    const char *p = strstr(json, "\"icaoId\":");
+    while (p) {
+        const char *next = strstr(p + 1, "\"icaoId\":");
+        int len = next ? (int)(next - p) : (int)strlen(p);
+        if (len > 4095) len = 4095;
+        char tmp[4096]; memcpy(tmp, p, len); tmp[len] = 0;
+        p = next;
+
+        const char *la = strstr(tmp, "\"lat\":"), *lo = strstr(tmp, "\"lon\":");
+        if (!la || !lo) continue;
+        double d = dist_nm(ac_lat, ac_lon, atof(la + 6), atof(lo + 6));
         if (d < best) {
-            const char *end = strchr(p, '}');
-            int len = end ? (int)(end - p + 1) : 4095;
-            if (len > 4095) len = 4095;
-            char tmp[4096]; strncpy(tmp, p, len); tmp[len] = 0;
             const char *f;
             float td=-1, ts=-1, tg=-1; time_t to=0;
             if ((f=strstr(tmp,"\"wdir\":"))  && f[7]!='"'&&f[7]!='n'&&f[7]!='V') td=(float)atof(f+7);
@@ -274,7 +276,6 @@ static void nearest_metar(const char *json, double ac_lat, double ac_lon,
             if ((f=strstr(tmp,"\"obsTime\":")))                                    to=(time_t)strtoll(f+10, NULL, 10);
             if (td >= 0 && ts >= 0) { best=d; *dir=td; *spd=ts; *gust=tg; *obs=to; }
         }
-        p++;
     }
 }
 
